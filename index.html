@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#2563eb">
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-192.png">
+<title>ماسح الباركود</title>
+<style>
+  :root { --blue:#2563eb; --bg:#f5f6f8; --card:#fff; --text:#111827; --muted:#6b7280; --ok:#16a34a; --bad:#dc2626; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#0f172a; --card:#1e293b; --text:#f1f5f9; --muted:#94a3b8; }
+  }
+  * { box-sizing:border-box; }
+  body { font-family:system-ui, Tahoma, sans-serif; margin:0; padding:16px; background:var(--bg); color:var(--text); }
+  .wrap { max-width:460px; margin:0 auto; }
+  .card { background:var(--card); border-radius:12px; padding:14px; margin-bottom:12px; box-shadow:0 1px 6px rgba(0,0,0,.08); }
+  #reader { width:100%; background:#000; border-radius:12px; overflow:hidden; min-height:200px; margin-bottom:12px; }
+  button { font:inherit; font-size:16px; padding:12px 16px; border:0; border-radius:10px; background:var(--blue); color:#fff; cursor:pointer; }
+  button.secondary { background:transparent; color:var(--blue); border:1px solid var(--blue); }
+  button.full { width:100%; }
+  .row { display:flex; gap:8px; align-items:center; justify-content:space-between; flex-wrap:wrap; }
+  #result { font-size:22px; font-weight:700; direction:ltr; text-align:center; word-break:break-all; padding:8px 0; min-height:40px; }
+  #status { text-align:center; color:var(--muted); font-size:15px; }
+  #status.ok { color:var(--ok); } #status.bad { color:var(--bad); }
+  .opt { display:flex; align-items:center; gap:8px; font-size:15px; }
+  #history { list-style:none; margin:0; padding:0; }
+  #history li { display:flex; gap:8px; align-items:center; justify-content:space-between; padding:8px 0; border-bottom:1px solid rgba(128,128,128,.25); }
+  #history span { direction:ltr; word-break:break-all; font-size:16px; }
+  #history button { padding:6px 12px; font-size:14px; }
+  h2 { font-size:16px; margin:0 0 8px; }
+  #installBtn { display:none; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div id="reader"></div>
+
+  <div class="card">
+    <div id="result">—</div>
+    <div id="status">اضغط «ابدأ المسح» ثم وجّه الكاميرا نحو الباركود</div>
+    <div class="row" style="margin-top:10px">
+      <button id="startBtn" type="button">ابدأ المسح</button>
+      <button id="copyBtn" type="button" class="secondary">نسخ</button>
+    </div>
+    <div class="row" style="margin-top:12px">
+      <label class="opt"><input type="checkbox" id="contBox"> مسح متواصل</label>
+      <label class="opt"><input type="checkbox" id="beepBox" checked> صوت</label>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>آخر القراءات</h2>
+    <ul id="history"></ul>
+    <button id="clearBtn" type="button" class="secondary full" style="margin-top:10px">مسح السجل</button>
+  </div>
+
+  <button id="installBtn" type="button" class="full">تثبيت التطبيق على الهاتف</button>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+<script>
+  const $ = id => document.getElementById(id);
+  const resultEl = $('result'), statusEl = $('status'), histEl = $('history');
+  const contBox = $('contBox'), beepBox = $('beepBox');
+  let scanner = null, running = false, lastCode = '', lastTime = 0, history = [];
+
+  // ---- إعدادات وسجل محفوظان على الهاتف ----
+  try {
+    history = JSON.parse(localStorage.getItem('scan_history') || '[]');
+    contBox.checked = localStorage.getItem('scan_cont') === '1';
+    beepBox.checked = localStorage.getItem('scan_beep') !== '0';
+  } catch (e) {}
+  function save() {
+    try {
+      localStorage.setItem('scan_history', JSON.stringify(history.slice(0, 30)));
+      localStorage.setItem('scan_cont', contBox.checked ? '1' : '0');
+      localStorage.setItem('scan_beep', beepBox.checked ? '1' : '0');
+    } catch (e) {}
+  }
+  contBox.addEventListener('change', save);
+  beepBox.addEventListener('change', save);
+
+  function setStatus(text, cls) { statusEl.textContent = text; statusEl.className = cls || ''; }
+
+  // ---- النسخ ----
+  async function copyText(text) {
+    try { await navigator.clipboard.writeText(text); return true; } catch (e) {}
+    try {  // طريقة بديلة للمتصفحات القديمة
+      const ta = document.createElement('textarea');
+      ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+      document.body.appendChild(ta); ta.select();
+      const ok = document.execCommand('copy');
+      document.body.removeChild(ta);
+      return ok;
+    } catch (e) { return false; }
+  }
+
+  function beep() {
+    if (!beepBox.checked) return;
+    try {
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const o = ctx.createOscillator(), g = ctx.createGain();
+      o.connect(g); g.connect(ctx.destination);
+      o.frequency.value = 1000; g.gain.value = 0.1;
+      o.start(); o.stop(ctx.currentTime + 0.12);
+    } catch (e) {}
+  }
+
+  function renderHistory() {
+    histEl.innerHTML = '';
+    if (!history.length) {
+      const li = document.createElement('li');
+      li.textContent = 'لا توجد قراءات بعد';
+      li.style.color = 'var(--muted)';
+      histEl.appendChild(li);
+      return;
+    }
+    history.slice(0, 30).forEach(code => {
+      const li = document.createElement('li');
+      const sp = document.createElement('span'); sp.textContent = code;
+      const b = document.createElement('button'); b.textContent = 'نسخ'; b.type = 'button';
+      b.addEventListener('click', async () => {
+        const ok = await copyText(code);
+        setStatus(ok ? '✅ تم النسخ: ' + code : 'تعذّر النسخ تلقائياً', ok ? 'ok' : 'bad');
+      });
+      li.append(sp, b);
+      histEl.appendChild(li);
+    });
+  }
+
+  // ---- المسح ----
+  async function onScan(code) {
+    const now = Date.now();
+    if (code === lastCode && now - lastTime < 2000) return;
+    lastCode = code; lastTime = now;
+
+    resultEl.textContent = code;
+    history = [code, ...history.filter(c => c !== code)].slice(0, 30);
+    save(); renderHistory();
+    if (navigator.vibrate) navigator.vibrate(80);
+    beep();
+
+    const ok = await copyText(code);
+    setStatus(ok ? '✅ تم النسخ. الصقه في أي حقل (ضغطة مطولة ثم لصق)'
+                 : 'اضغط «نسخ» لنسخ الرمز', ok ? 'ok' : 'bad');
+
+    if (!contBox.checked) await stopScanner();
+  }
+
+  async function startScanner() {
+    if (running) return;
+    scanner = new Html5Qrcode('reader');
+    const F = Html5QrcodeSupportedFormats;
+    try {
+      await scanner.start(
+        { facingMode: 'environment' },
+        { fps: 10, qrbox: { width: 260, height: 160 },
+          formatsToSupport: [F.EAN_13, F.EAN_8, F.UPC_A, F.UPC_E, F.CODE_128, F.CODE_39, F.QR_CODE] },
+        onScan, () => {}
+      );
+      running = true;
+      $('startBtn').textContent = 'إيقاف';
+      setStatus('وجّه الكاميرا نحو الباركود');
+    } catch (e) {
+      scanner = null;
+      setStatus('تعذّر تشغيل الكاميرا. اسمح بالوصول إليها وتأكد أن الصفحة https.', 'bad');
+    }
+  }
+
+  async function stopScanner() {
+    if (scanner) {
+      try { await scanner.stop(); scanner.clear(); } catch (e) {}
+      scanner = null;
+    }
+    running = false;
+    $('startBtn').textContent = 'ابدأ المسح';
+  }
+
+  $('startBtn').addEventListener('click', () => running ? stopScanner() : startScanner());
+  $('copyBtn').addEventListener('click', async () => {
+    const text = resultEl.textContent;
+    if (!text || text === '—') return setStatus('لا توجد قراءة بعد', 'bad');
+    const ok = await copyText(text);
+    setStatus(ok ? '✅ تم النسخ' : 'تعذّر النسخ', ok ? 'ok' : 'bad');
+  });
+  $('clearBtn').addEventListener('click', () => { history = []; save(); renderHistory(); });
+  renderHistory();
+
+  // ---- تثبيت التطبيق (PWA) ----
+  let deferredPrompt = null;
+  window.addEventListener('beforeinstallprompt', e => {
+    e.preventDefault(); deferredPrompt = e;
+    $('installBtn').style.display = 'block';
+  });
+  $('installBtn').addEventListener('click', async () => {
+    if (!deferredPrompt) return;
+    deferredPrompt.prompt();
+    await deferredPrompt.userChoice;
+    deferredPrompt = null;
+    $('installBtn').style.display = 'none';
+  });
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('sw.js').catch(() => {});
+  }
+</script>
+</body>
+</html>
